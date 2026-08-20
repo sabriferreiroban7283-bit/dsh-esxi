@@ -1,0 +1,33 @@
+# dsh-esxi bundle patch
+# dsh-esxi 束补丁（bundle patch）
+#
+# English: this file is the `dsh.bundle.patch` layer of the package: when the
+# plugin is installed through the official CLI —
+#
+#   dsh plugin --profile <name> add dsh-esxi
+#
+# — the command reconciles `dsh.profile.bundles` against installed packages
+# and, seeing this declaration, appends `dsh-esxi` to the bundle stack. The
+# profile boot then merges THIS patch (a single `insert` of the plugin row)
+# into the composition. No profile file edits needed — one command installs
+# and mounts.
+#
+# 中文：本文件是包的 `dsh.bundle.patch` 层。通过官方 CLI 安装插件后——
+#
+#   dsh plugin --profile <name> add dsh-esxi
+#
+# ——命令会根据已安装的包对账 `dsh.profile.bundles`，看到本声明后自动把
+# `dsh-esxi` 追加到 bundle 栈；profile 启动时本补丁（一行 `insert` 插件行）
+# 会被合并进组合配置。无需手工改 profile 文件——一条命令即可安装并挂载。
+#
+# The row id is `esxi`; override the plugin's configuration from the profile's
+# own cordis.patch.yml with:
+# 插件行 id 为 `esxi`；可在 profile 自身的 cordis.patch.yml 中覆盖配置，例如：
+#
+#   - id: esxi
+#     config:
+#       govcPath: /opt/govc/bin/govc
+#       defaultTimeoutMs: 120000
+- insert:
+    - id: esxi
+      name: dsh-esxi

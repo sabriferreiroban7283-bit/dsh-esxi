@@ -1,0 +1,64 @@
+{
+  "name": "dsh-esxi",
+  "version": "0.2.0",
+  "description": "DSH plugin for ESXi / vCenter (vSphere) operations: connection profiles, inventory, VMs, hosts, datastores, networking, clusters, resource pools, tags, permissions, roles, licensing, content library, tasks/events/alarms, and raw govc passthrough. Backed by the official govc CLI.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "README.i18n.yaml",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/core.mjs && node test/smoke.mjs && node test/client.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots",
+        "locale",
+        "settingsScope"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "esxi",
+    "vcenter",
+    "vsphere",
+    "vmware",
+    "govc",
+    "govmomi"
+  ]
+}

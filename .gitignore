@@ -1,0 +1,22 @@
+# Node
+node_modules/
+*.tgz
+*.log
+
+# Local work artifacts (ISOs, images, logs — never committed)
+.work/
+*.iso
+*.ova
+*.vmdk
+*.img
+*.qcow2
+cloudinit-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+autoinstall-seed/
