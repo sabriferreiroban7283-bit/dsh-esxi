@@ -187,7 +187,10 @@ window.__ModuleLoader__.load({
 			const [error, setError] = React.useState(null);
 			React.useEffect(() => scope.subscribe(() => setSnapshot(scope.getSnapshot())), [scope]);
 			React.useEffect(() => {
-				scope.load();
+				// The legacy settings scope needed an explicit load(); current
+				// cores derive the snapshot from a shared mirror automatically
+				// and expose no load method, so only call it when present.
+				if (typeof scope.load === "function") scope.load();
 			}, [scope]);
 
 			if (snapshot.status !== "ready") {
@@ -466,7 +469,7 @@ window.__ModuleLoader__.load({
 					listeners.add(listener);
 					return () => listeners.delete(listener);
 				},
-				load: () => (bridgeActive ? bridge : native).load(),
+				load: () => (bridgeActive ? bridge : native).load?.(),
 				set: (field, value) => (bridgeActive ? bridge : native).set(field, value),
 				unset: (field) => (bridgeActive ? bridge : native).unset(field)
 			};
