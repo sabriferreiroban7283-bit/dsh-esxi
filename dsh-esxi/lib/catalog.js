@@ -562,7 +562,7 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_vm_create",
-		description: "Create a new VM from scratch (govc vm.create): name, CPU, memory, disk, guest OS id, network, datastore, folder, resource pool, optional power-on. An ISO can be attached at creation time (iso/isoDatastore).",
+		description: "Create a new VM from scratch (govc vm.create): name, CPU, memory, disk, guest OS id, network, datastore, folder, resource pool, optional power-on. An ISO can be attached at creation time (iso/isoDatastore). Field note: pass `network` explicitly — when it is omitted govc tries to resolve the DEFAULT network and fails with 'default network resolves to multiple instances' on multi-network hosts.",
 		params: {
 			profile: PROFILE_PARAM,
 			name: S("string", "New VM name.", { required: true }),
@@ -2119,7 +2119,7 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_tag_create",
-		description: "Create a tag category (with cardinality and associable object types) or a tag inside a category (govc tags.category.create / tags.create).",
+		description: "Create a tag category (with cardinality and associable object types) or a tag inside a category (govc tags.category.create / tags.create). Tags are a vCenter feature: on standalone ESXi the tagging REST API is absent and the call fails with an unhelpful 400 — this tool translates that into guidance.",
 		params: {
 			profile: PROFILE_PARAM,
 			operation: S("string", "category creates a tag category; tag creates a tag.", { required: true, enum: ["category", "tag"] }),
@@ -2129,20 +2129,33 @@ export const TOOLS = [
 			multi: S("boolean", "Allow multiple tags per object (category)."),
 			types: S("string", "Associable object types, comma-separated, e.g. 'VirtualMachine,Datastore' (category; empty = all).")
 		},
-		build(args) {
+		custom: async function esxiTagCreate(ctx, config, store, args) {
+			validateArgs(this.params, args);
+			const resolved = resolveProfileForCall(store, args);
+			const password = await resolvePassword(ctx, resolved.profile);
+			const env = buildEnv(resolved.profile, { password });
+			let argv;
 			if (args.operation === "category") {
-				const argv = ["tags.category.create"];
+				argv = ["tags.category.create"];
 				if (args.description !== undefined) argv.push("-d", args.description);
 				if (args.multi) argv.push("-m");
 				for (const type of splitCsv(args.types)) argv.push("-t", type);
 				argv.push(args.name);
-				return { argv };
+			} else {
+				if (!args.category) throw new Error("invalid arguments: category is required for tag operation");
+				argv = ["tags.create", "-c", args.category];
+				if (args.description !== undefined) argv.push("-d", args.description);
+				argv.push(args.name);
 			}
-			if (!args.category) throw new Error("invalid arguments: category is required for tag operation");
-			const argv = ["tags.create", "-c", args.category];
-			if (args.description !== undefined) argv.push("-d", args.description);
-			argv.push(args.name);
-			return { argv };
+			try {
+				const out = await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				return { kind: "ok", text: truncateOutput(out.stdout.trim() || `Created tag ${args.operation} "${args.name}".`, config.maxOutputChars) };
+			} catch (error) {
+				if (/400 Bad Request|404 Not Found|Tagging/i.test(error.message ?? "")) {
+					throw new Error(`tags require vCenter Server — the tagging REST API does not exist on a standalone ESXi host (${error.message})`);
+				}
+				throw error;
+			}
 		},
 		gate(args) {
 			return `Create tag ${args.operation} "${args.name}"`;
@@ -2186,7 +2199,7 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_permission_set",
-		description: "Grant a permission to a principal (user or group) with a role on an entity, optionally propagating (govc permissions.set).",
+		description: "Grant a permission to a principal (user or group) with a role on an entity, optionally propagating (govc permissions.set). Field note: standalone ESXi refuses any change that could reduce the root principal's Admin rights (the call errors with 'could leave the system without full administrative privileges') — grant limited roles to NON-root principals instead.",
 		params: {
 			profile: PROFILE_PARAM,
 			principal: S("string", "User or group name, e.g. user@vsphere.local.", { required: true }),
@@ -2245,16 +2258,15 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_role_create",
-		description: "Create a role (govc role.create) with a list of privileges.",
+		description: "Create a role (govc role.create) with a list of privileges. Note the govc syntax: NAME comes FIRST, privileges follow it.",
 		params: {
 			profile: PROFILE_PARAM,
 			name: S("string", "Role name.", { required: true }),
 			privileges: S("string", "Privilege ids to include, comma-separated (empty = no privileges).")
 		},
 		build(args) {
-			const argv = ["role.create"];
+			const argv = ["role.create", args.name];
 			for (const privilege of splitCsv(args.privileges)) argv.push(privilege);
-			argv.push(args.name);
 			return { argv };
 		},
 		gate(args) {

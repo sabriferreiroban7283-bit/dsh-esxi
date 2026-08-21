@@ -56,6 +56,13 @@ case "$1" in
   role.ls)
     echo '[{"Name":"Admin","Privilege":["System.Anonymous","System.View"]}]'
     ;;
+  role.create)
+    echo "ROLECREATE $*"
+    ;;
+  tags.category.create)
+    echo "fake govc: tags.category.create failed: 400 Bad Request: []" >&2
+    exit 1
+    ;;
   license.ls)
     echo '[{"LicenseKey":"XXXXX-00000-11111-22222-33333","Name":"vSphere 8 Enterprise Plus","Total":0,"Used":0,"EditionKey":"esx"}]'
     ;;
@@ -541,6 +548,11 @@ try {
 	check("esxi_vm_quick injects the cloud-init seed", quickCi.includes("cloud-init seed injected via guestinfo"), quickCi);
 	check("esxi_vm_quick skips ISO/serial when not requested", !quickCi.includes("attached ISO") && !quickCi.includes("serial console"), quickCi);
 	await expectThrow("esxi_vm_quick", { name: "q2", datastore: "d" }, /missing required parameter "disk"/, "quick create without disk rejected");
+
+	// ── round 4: role positional order + tags vCenter-only translation ──────
+	const roleOut = (await exec("esxi_role_create", { name: "ops", privileges: "System.View,VirtualMachine.Interact.PowerOn" })).text;
+	check("esxi_role_create puts NAME before privileges", roleOut.includes("ROLECREATE role.create ops System.View VirtualMachine.Interact.PowerOn"), roleOut);
+	await expectThrow("esxi_tag_create", { operation: "category", name: "env", types: "VirtualMachine" }, /tags require vCenter Server/, "tag create on standalone host translated");
 
 	// ── esxi_seed_iso (autoinstall seed generation + upload) ───────────────
 	const seedUpload = (await exec("esxi_seed_iso", {
