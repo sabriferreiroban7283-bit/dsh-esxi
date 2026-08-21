@@ -589,6 +589,66 @@ export const TOOLS = [
 		}
 	},
 	{
+		name: "esxi_vm_quick",
+		description: "One-call VM creation with the field-tested recipe baked in: create the VM (govc vm.create), optionally attach an ISO on a new CD-ROM (adds the device, inserts, connects, sets cdrom-first boot), optionally add a file-backed serial console, then optionally power on. Returns what was created and the next steps. This is the multi-call recipe esxi_vm_create → esxi_vm_iso add/insert/connect → esxi_vm_boot → esxi_vm_serial add/connect → esxi_vm_power compressed into one invocation.",
+		params: {
+			profile: PROFILE_PARAM,
+			name: S("string", "New VM name.", { required: true }),
+			cpu: S("integer", "Number of vCPUs (default 1).", { min: 1 }),
+			memory: S("integer", "Memory in MB (default 1024).", { min: 1 }),
+			disk: S("string", "Disk size, e.g. '20GB'.", { required: true }),
+			datastore: S("string", "Datastore for the VM files and disk.", { required: true }),
+			guestId: S("string", "Guest OS identifier (default otherGuest64)."),
+			network: S("string", "Network for the first NIC (default: none)."),
+			adapter: S("string", "NIC adapter type (default e1000; vmxnet3 recommended)."),
+			iso: S("string", "ISO to attach on a new CD-ROM at creation, e.g. 'iso/ubuntu-24.04.4-live-server-amd64.iso' (datastore path)."),
+			isoDatastore: S("string", "Datastore holding the ISO (defaults to datastore)."),
+			bootFromIso: S("boolean", "Set cdrom-first boot order when an ISO is attached (default true)."),
+			serial: S("boolean", "Also add a file-backed serial console capturing boot logs to <vm>/serialport-9000.log (default false)."),
+			powerOn: S("boolean", "Power the VM on afterwards (default false).")
+		},
+		custom: async function esxiVmQuick(ctx, config, store, args) {
+			validateArgs(this.params, args);
+			const resolved = resolveProfileForCall(store, args);
+			const password = await resolvePassword(ctx, resolved.profile);
+			const env = buildEnv(resolved.profile, { password });
+			const steps = [];
+			const argv = ["vm.create", "-c", String(args.cpu ?? 1), "-m", String(args.memory ?? 1024), "-disk", args.disk, "-on=false"];
+			argv.push("-ds", args.datastore);
+			if (args.guestId !== undefined) argv.push("-g", args.guestId);
+			if (args.network !== undefined) argv.push("-net", args.network);
+			if (args.adapter !== undefined) argv.push("-net.adapter", args.adapter);
+			argv.push(args.name);
+			await runGovc(config.govcPath, argv, { env, timeoutMs: 300000, maxBufferBytes: config.maxOutputBytes });
+			steps.push(`created VM "${args.name}" (${args.cpu ?? 1} vCPU / ${args.memory ?? 1024}MB / disk ${args.disk} on ${args.datastore})`);
+			if (args.iso !== undefined) {
+				const addOut = await runGovc(config.govcPath, ["device.cdrom.add", "-vm", args.name], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				const device = (addOut.stdout || "").trim() || "cdrom-3000";
+				await runGovc(config.govcPath, ["device.cdrom.insert", "-vm", args.name, "-device", device, "-ds", args.isoDatastore ?? args.datastore, args.iso], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				await runGovc(config.govcPath, ["device.connect", "-vm", args.name, device], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				if (args.bootFromIso !== false) await runGovc(config.govcPath, ["device.boot", "-vm", args.name, "-order", "cdrom,disk"], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				steps.push(`attached ISO ${args.iso} on ${device} (connected${args.bootFromIso === false ? ", boot order unchanged" : ", cdrom-first boot"})`);
+			}
+			if (args.serial) {
+				const addOut = await runGovc(config.govcPath, ["device.serial.add", "-vm", args.name], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				const port = (addOut.stdout || "").trim() || "serialport-9000";
+				await runGovc(config.govcPath, ["device.serial.connect", "-vm", args.name, "-device", port, "-"], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				await runGovc(config.govcPath, ["device.connect", "-vm", args.name, port], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				steps.push(`serial console ${port} → [${args.datastore}] ${args.name}/${port}.log`);
+			}
+			if (args.powerOn) {
+				await runGovc(config.govcPath, ["vm.power", "-on", args.name], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				steps.push("powered on");
+			} else {
+				steps.push("left powered off (esxi_vm_power {operation: 'on'} to boot)");
+			}
+			return { kind: "ok", text: truncateOutput(steps.join("\n"), config.maxOutputChars) };
+		},
+		gate(args) {
+			return `Quick-create VM "${args.name}"${args.powerOn ? " (and power on)" : ""}`;
+		}
+	},
+	{
 		name: "esxi_vm_iso",
 		description: "Manage a VM's CD-ROM media (govc device.cdrom.*): add a new CD-ROM device, insert an ISO from a datastore or content library into it, or eject the current media. Without a device name, the first CD-ROM device is used (insert/eject). Insert/add also connect the device (a disconnected CD-ROM is invisible to the guest — e.g. cloud-init NoCloud seeds).",
 		params: {
@@ -615,9 +675,12 @@ export const TOOLS = [
 				if (args.datastore !== undefined) argv.push("-ds", args.datastore);
 				argv.push(args.iso);
 			}
-			out.push((await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes })).stdout);
+			const firstStdout = (await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes })).stdout;
+			out.push(firstStdout);
 			if (args.operation !== "eject" && args.connect !== false) {
-				const device = args.device ?? "";
+				// `add` prints the NEW device name (e.g. cdrom-3000) — use it for
+				// the connect; an empty device name connects nothing.
+				const device = args.device ?? (args.operation === "add" ? (firstStdout || "").trim() : "");
 				out.push((await runGovc(config.govcPath, ["device.connect", "-vm", args.vm, device], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes })).stdout);
 			}
 			return { kind: "ok", text: truncateOutput(out.filter((s) => s.trim()).join("\n") || `${args.operation} done`, config.maxOutputChars) };

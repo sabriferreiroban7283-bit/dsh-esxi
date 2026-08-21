@@ -81,7 +81,7 @@ case "$1" in
     echo "CDROM-EJECT $*"
     ;;
   device.cdrom.add)
-    echo "CDROM-ADD $*"
+    echo "cdrom-3000"
     ;;
   device.connect)
     echo "DEVICE-CONNECT $*"
@@ -94,6 +94,12 @@ case "$1" in
     ;;
   device.serial.connect)
     echo "SERIAL-CONNECT $*"
+    ;;
+  vm.create)
+    echo "VMCREATE $*"
+    ;;
+  vm.power)
+    echo "VMPOWER $*"
     ;;
   vm.disk.create)
     echo "DISK-CREATE $*"
@@ -460,11 +466,11 @@ try {
 	// ── esxi_run passthrough + arg safety ───────────────────────────────────
 	let runError = null;
 	try {
-		await exec("esxi_run", { args: "vm.power -off web-01" });
+		await exec("esxi_run", { args: "vm.not-a-real-command -off web-01" });
 	} catch (error) {
 		runError = error.message;
 	}
-	check("esxi_run executes govc subcommand", runError !== null && runError.includes("fake govc: unknown command: vm.power -off web-01"), runError ?? "no error (fake govc should reject)");
+	check("esxi_run executes govc subcommand", runError !== null && runError.includes("fake govc: unknown command: vm.not-a-real-command -off web-01"), runError ?? "no error (fake govc should reject)");
 
 	let invalid = null;
 	try {
@@ -509,7 +515,7 @@ try {
 	const isoEject = (await exec("esxi_vm_iso", { vm: "x", operation: "eject" })).text;
 	check("esxi_vm_iso eject defaults to the first CD-ROM", isoEject.includes("CDROM-EJECT device.cdrom.eject -vm x"), isoEject);
 	const isoAdd = (await exec("esxi_vm_iso", { vm: "x", operation: "add", controller: "ide-200" })).text;
-	check("esxi_vm_iso add passes the controller", isoAdd.includes("CDROM-ADD device.cdrom.add -vm x -controller ide-200"), isoAdd);
+	check("esxi_vm_iso add returns the device and connects it", isoAdd.includes("cdrom-3000") && isoAdd.includes("DEVICE-CONNECT device.connect -vm x cdrom-3000"), isoAdd);
 	const bootOrder = (await exec("esxi_vm_boot", { vm: "x", order: "cdrom,disk", delay: 500, secure: false })).text;
 	check("esxi_vm_boot builds the device.boot argv", bootOrder.includes("BOOT device.boot -vm x -order cdrom,disk -delay 500 -secure=false"), bootOrder);
 
@@ -521,6 +527,14 @@ try {
 	const cloneOk = (await exec("esxi_vm_clone", { vm: "VM1", name: "c1", powerOn: false })).text;
 	check("esxi_vm_clone defaults the datastore to the source VM's", cloneOk.includes("CLONE vm.clone -vm VM1 -on=false -ds datastore1 c1"), cloneOk);
 	await expectThrow("esxi_vm_clone", { vm: "VM1", name: "licensetest" }, /license does not permit CloneVM_Task/, "clone license failure translated");
+
+	// ── esxi_vm_quick (one-call recipe: create + ISO + serial + power) ──────
+	const quickOut = (await exec("esxi_vm_quick", { name: "q1", cpu: 2, memory: 2048, disk: "10GB", datastore: "datastore1", iso: "iso/x.iso", serial: true, powerOn: true })).text;
+	check("esxi_vm_quick creates the VM", quickOut.includes('created VM "q1" (2 vCPU / 2048MB / disk 10GB on datastore1)'), quickOut);
+	check("esxi_vm_quick attaches and connects the ISO", quickOut.includes("attached ISO iso/x.iso on cdrom-3000 (connected, cdrom-first boot)"), quickOut);
+	check("esxi_vm_quick wires the serial console", quickOut.includes("serial console serialport-9001 → [datastore1] q1/serialport-9001.log"), quickOut);
+	check("esxi_vm_quick powers on", quickOut.includes("powered on"), quickOut);
+	await expectThrow("esxi_vm_quick", { name: "q2", datastore: "d" }, /missing required parameter "disk"/, "quick create without disk rejected");
 
 	// ── esxi_seed_iso (autoinstall seed generation + upload) ───────────────
 	const seedUpload = (await exec("esxi_seed_iso", {
