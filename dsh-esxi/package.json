@@ -1,6 +1,6 @@
 {
   "name": "dsh-esxi",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "DSH plugin for ESXi / vCenter (vSphere) operations: connection profiles, inventory, VMs, hosts, datastores, networking, clusters, resource pools, tags, permissions, roles, licensing, content library, tasks/events/alarms, and raw govc passthrough. Backed by the official govc CLI.",
   "type": "module",
   "main": "lib/index.js",

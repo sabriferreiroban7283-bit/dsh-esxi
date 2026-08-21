@@ -68,6 +68,30 @@ async function vmDatastore(config, env, vm) {
 	return urls[0].name;
 }
 
+/**
+* Inject a cloud-init seed into a VM via VMware guestinfo (base64 user-data +
+* meta-data with encoding flags). Shared by esxi_vm_cloudinit and esxi_vm_quick.
+*/
+async function setGuestinfoSeed(config, env, vm, userData, metaData) {
+	const files = [
+		{ key: "guestinfo.userdata", content: Buffer.from(String(userData), "utf8").toString("base64") },
+		{ key: "guestinfo.metadata", content: Buffer.from(String(metaData), "utf8").toString("base64") }
+	];
+	const tmp = join(tmpdir(), `dsh-esxi-cloudinit-${process.pid}-${Date.now().toString(36)}`);
+	const argv = ["vm.change", "-vm", vm];
+	try {
+		for (let i = 0; i < files.length; i++) {
+			const p = `${tmp}-${i}`;
+			await writeFile(p, files[i].content);
+			argv.push("-f", `${files[i].key}=${p}`);
+		}
+		argv.push("-e", "guestinfo.userdata.encoding=base64", "-e", "guestinfo.metadata.encoding=base64");
+		await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+	} finally {
+		await Promise.all(files.map((_, i) => rm(`${tmp}-${i}`, { force: true }).catch(() => {})));
+	}
+}
+
 /** Run the standard single-command path for a catalog tool. */
 export async function runTool(ctx, config, store, def, args) {
 	validateArgs(def.params, args);
@@ -604,6 +628,7 @@ export const TOOLS = [
 			iso: S("string", "ISO to attach on a new CD-ROM at creation, e.g. 'iso/ubuntu-24.04.4-live-server-amd64.iso' (datastore path)."),
 			isoDatastore: S("string", "Datastore holding the ISO (defaults to datastore)."),
 			bootFromIso: S("boolean", "Set cdrom-first boot order when an ISO is attached (default true)."),
+			cloudinit: S("string", "Inline '#cloud-config' user-data (or a local file path) to inject via guestinfo BEFORE first power-on — the one-click cloud-image provision. The meta-data (instance-id + local-hostname) is derived from the VM name."),
 			serial: S("boolean", "Also add a file-backed serial console capturing boot logs to <vm>/serialport-9000.log (default false)."),
 			powerOn: S("boolean", "Power the VM on afterwards (default false).")
 		},
@@ -635,6 +660,13 @@ export const TOOLS = [
 				await runGovc(config.govcPath, ["device.serial.connect", "-vm", args.name, "-device", port, "-"], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
 				await runGovc(config.govcPath, ["device.connect", "-vm", args.name, port], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
 				steps.push(`serial console ${port} → [${args.datastore}] ${args.name}/${port}.log`);
+			}
+			if (args.cloudinit !== undefined) {
+				const userData = args.cloudinit.includes("\n") || args.cloudinit.startsWith("#cloud-config") || args.cloudinit.startsWith("#!")
+					? args.cloudinit
+					: await readFile(args.cloudinit, "utf8").catch(() => { throw new Error(`invalid arguments: cloudinit is neither inline YAML nor a readable file: ${args.cloudinit}`); });
+				await setGuestinfoSeed(config, env, args.name, userData, `instance-id: ${args.name}-001\nlocal-hostname: ${args.name}`);
+				steps.push(`cloud-init seed injected via guestinfo (power on to apply on first boot)`);
 			}
 			if (args.powerOn) {
 				await runGovc(config.govcPath, ["vm.power", "-on", args.name], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
@@ -1057,23 +1089,7 @@ export const TOOLS = [
 			} else if (args.instanceId !== undefined) {
 				metaData = String(metaData).replace(/^instance-id:.*$/m, `instance-id: ${args.instanceId}`);
 			}
-			const files = [
-				{ key: "guestinfo.userdata", content: Buffer.from(userData, "utf8").toString("base64") },
-				{ key: "guestinfo.metadata", content: Buffer.from(metaData, "utf8").toString("base64") }
-			];
-			const tmp = join(tmpdir(), `dsh-esxi-cloudinit-${process.pid}-${Date.now().toString(36)}`);
-			const argv = ["vm.change", "-vm", args.vm];
-			try {
-				for (let i = 0; i < files.length; i++) {
-					const p = `${tmp}-${i}`;
-					await writeFile(p, files[i].content);
-					argv.push("-f", `${files[i].key}=${p}`);
-				}
-				argv.push("-e", "guestinfo.userdata.encoding=base64", "-e", "guestinfo.metadata.encoding=base64");
-				await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
-			} finally {
-				await Promise.all(files.map((_, i) => rm(`${tmp}-${i}`, { force: true }).catch(() => {})));
-			}
+			await setGuestinfoSeed(config, env, args.vm, userData, metaData);
 			return {
 				kind: "ok",
 				text: truncateOutput([
@@ -1987,14 +2003,14 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_pool_list",
-		description: "List resource pools with CPU/memory limits, reservations, and shares (govc pool.info).",
+		description: "List resource pools with CPU/memory limits, reservations, and shares (govc pool.info). With no pool, lists every pool on every host. Note: hosts inside dot-named folders (e.g. 'localhost.') break absolute pool paths — the glob form '*/Resources/<pool>' resolves them.",
 		params: {
 			profile: PROFILE_PARAM,
-			pool: S("string", "Optional pool path to show just one.")
+			pool: S("string", "Optional pool path to show just one (e.g. '*/Resources/my-pool' — the glob form also resolves hosts inside dot-named folders).")
 		},
 		build(args) {
 			const argv = ["pool.info", "-json"];
-			if (args.pool !== undefined) argv.push(args.pool);
+			argv.push(args.pool !== undefined ? args.pool : "*/Resources/*");
 			return { argv };
 		},
 		format(outputs) {

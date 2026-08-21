@@ -101,6 +101,9 @@ case "$1" in
   vm.power)
     echo "VMPOWER $*"
     ;;
+  vm.change)
+    echo "VMCHANGE $*"
+    ;;
   vm.disk.create)
     echo "DISK-CREATE $*"
     ;;
@@ -534,6 +537,9 @@ try {
 	check("esxi_vm_quick attaches and connects the ISO", quickOut.includes("attached ISO iso/x.iso on cdrom-3000 (connected, cdrom-first boot)"), quickOut);
 	check("esxi_vm_quick wires the serial console", quickOut.includes("serial console serialport-9001 → [datastore1] q1/serialport-9001.log"), quickOut);
 	check("esxi_vm_quick powers on", quickOut.includes("powered on"), quickOut);
+	const quickCi = (await exec("esxi_vm_quick", { name: "q2", cpu: 1, memory: 512, disk: "10GB", datastore: "datastore1", cloudinit: "#cloud-config\nhostname: q2\n", powerOn: true })).text;
+	check("esxi_vm_quick injects the cloud-init seed", quickCi.includes("cloud-init seed injected via guestinfo"), quickCi);
+	check("esxi_vm_quick skips ISO/serial when not requested", !quickCi.includes("attached ISO") && !quickCi.includes("serial console"), quickCi);
 	await expectThrow("esxi_vm_quick", { name: "q2", datastore: "d" }, /missing required parameter "disk"/, "quick create without disk rejected");
 
 	// ── esxi_seed_iso (autoinstall seed generation + upload) ───────────────
