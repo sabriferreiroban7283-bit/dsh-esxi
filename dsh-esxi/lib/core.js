@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { mkdir, readFile, rename, rm, writeFile, stat, chmod } from "node:fs/promises";
 import { createGunzip } from "node:zlib";
 import { createWriteStream } from "node:fs";import { pipeline } from "node:stream/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
 const execFileP = promisify(execFile);
@@ -283,6 +283,22 @@ export async function runGovc(govcPath, argv, { env, timeoutMs = 120000, maxBuff
 		stdout = result.stdout ?? "";
 		stderr = result.stderr ?? "";
 	} catch (error) {
+		// The harness host occasionally loses the installed govc binary; recover
+		// transparently by re-installing it once and retrying the same command.
+		if (error.code === "ENOENT") {
+			try {
+				await installGovc(dirname(govcPath));
+				const result = await execFileP(govcPath, argv, {
+					env,
+					timeout: timeoutMs,
+					maxBuffer: maxBufferBytes,
+					windowsHide: true
+				});
+				return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+			} catch {
+				/* fall through to the original error */
+			}
+		}
 		stdout = error.stdout ?? "";
 		stderr = error.stderr ?? "";
 		const timedOut = error.killed === true || error.signal === "SIGTERM" || error.code === "ETIMEDOUT";

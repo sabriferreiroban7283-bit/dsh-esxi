@@ -54,6 +54,20 @@ function genSalt() {
 	return randomBytes(16).toString("base64").replaceAll("+", ".").slice(0, 16);
 }
 
+/**
+* Resolve a VM's (first) datastore via `vm.info -json`, so tools that need a
+* datastore can default to the VM's own instead of failing on govc's ambiguous
+* default-datastore resolution.
+*/
+async function vmDatastore(config, env, vm) {
+	const result = await runGovc(config.govcPath, ["vm.info", "-json", vm], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+	const doc = JSON.parse(result.stdout);
+	const urls = doc?.virtualMachines?.[0]?.config?.datastoreUrl ?? [];
+	if (urls.length === 0) throw new Error(`could not determine the datastore of VM "${vm}"; pass datastore explicitly`);
+	if (urls.length > 1) throw new Error(`VM "${vm}" spans multiple datastores (${urls.map((u) => u.name).join(", ")}); pass datastore explicitly`);
+	return urls[0].name;
+}
+
 /** Run the standard single-command path for a catalog tool. */
 export async function runTool(ctx, config, store, def, args) {
 	validateArgs(def.params, args);
@@ -809,7 +823,7 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_vm_clone",
-		description: "Clone a VM or template (govc vm.clone): full or linked clone, from an optional snapshot, optionally as a template, optionally powered on.",
+		description: "Clone a VM or template (govc vm.clone): full or linked clone, from an optional snapshot, optionally as a template, optionally powered on. The datastore defaults to the source VM's datastore. Note: standalone hosts without the CloneVM license right reject cloning — the error is translated for you.",
 		params: {
 			profile: PROFILE_PARAM,
 			vm: S("string", "Source VM or template name/path.", { required: true }),
@@ -818,27 +832,41 @@ export const TOOLS = [
 			template: S("boolean", "Create a template instead of a VM."),
 			powerOn: S("boolean", "Power on the clone (default true)."),
 			linked: S("boolean", "Create a linked clone (needs a snapshot)."),
-			datastore: S("string", "Target datastore."),
+			datastore: S("string", "Target datastore (defaults to the source VM's datastore)."),
 			pool: S("string", "Target resource pool."),
 			folder: S("string", "Target inventory folder."),
 			host: S("string", "Target host."),
 			cpu: S("integer", "Override vCPU count.", { min: 1 }),
 			memory: S("integer", "Override memory in MB.", { min: 1 })
 		},
-		build(args) {
+		custom: async function esxiVmClone(ctx, config, store, args) {
+			validateArgs(this.params, args);
+			const resolved = resolveProfileForCall(store, args);
+			const password = await resolvePassword(ctx, resolved.profile);
+			const env = buildEnv(resolved.profile, { password });
+			let datastore = args.datastore;
+			if (datastore === undefined) datastore = await vmDatastore(config, env, args.vm);
 			const argv = ["vm.clone", "-vm", args.vm];
 			if (args.snapshot !== undefined) argv.push("-snapshot", args.snapshot);
 			if (args.template) argv.push("-template");
 			if (args.powerOn === false) argv.push("-on=false");
 			if (args.linked) argv.push("-link");
-			if (args.datastore !== undefined) argv.push("-ds", args.datastore);
+			if (datastore !== undefined) argv.push("-ds", datastore);
 			if (args.pool !== undefined) argv.push("-pool", args.pool);
 			if (args.folder !== undefined) argv.push("-folder", args.folder);
 			if (args.host !== undefined) argv.push("-host", args.host);
 			if (args.cpu !== undefined) argv.push("-c", String(args.cpu));
 			if (args.memory !== undefined) argv.push("-m", String(args.memory));
 			argv.push(args.name);
-			return { argv, timeoutMs: 600000 };
+			try {
+				const out = await runGovc(config.govcPath, argv, { env, timeoutMs: 600000, maxBufferBytes: config.maxOutputBytes });
+				return { kind: "ok", text: truncateOutput(out.stdout.trim() || `Cloned "${args.name}" from "${args.vm}".`, config.maxOutputChars) };
+			} catch (error) {
+				if (/not supported on the object/i.test(error.message ?? "")) {
+					throw new Error(`clone failed: this host's license does not permit CloneVM_Task (typical on standalone ESXi without the clone right). Use esxi_vm_export + esxi_vm_import or re-create the VM instead. Original error: ${error.message}`);
+				}
+				throw error;
+			}
 		},
 		gate(args) {
 			return `Clone ${args.template ? "to template" : "VM"} "${args.name}" from "${args.vm}"`;
@@ -1011,12 +1039,18 @@ export const TOOLS = [
 			eager: S("boolean", "Eagerly scrub a new disk (implies thick)."),
 			mode: S("string", "Disk mode.", { enum: ["persistent", "nonpersistent", "undoable", "independent_persistent", "independent_nonpersistent", "append"] })
 		},
-		build(args) {
+		custom: async function esxiVmDisk(ctx, config, store, args) {
+			validateArgs(this.params, args);
+			const resolved = resolveProfileForCall(store, args);
+			const password = await resolvePassword(ctx, resolved.profile);
+			const env = buildEnv(resolved.profile, { password });
 			const argv = [];
 			if (args.operation === "create") {
 				if (!args.size) throw new Error("invalid arguments: size is required for create (e.g. '20GB')");
+				let datastore = args.datastore;
+				if (datastore === undefined) datastore = await vmDatastore(config, env, args.vm);
 				argv.push("vm.disk.create", "-vm", args.vm, "-name", args.name, "-size", args.size);
-				if (args.datastore !== undefined) argv.push("-ds", args.datastore);
+				if (datastore !== undefined) argv.push("-ds", datastore);
 				if (args.controller !== undefined) argv.push("-controller", args.controller);
 				if (args.thick) argv.push("-thick");
 				if (args.eager) argv.push("-eager");
@@ -1032,7 +1066,8 @@ export const TOOLS = [
 				if (!args.size) throw new Error("invalid arguments: size is required for resize (grow only, e.g. '200GB')");
 				argv.push("vm.disk.change", "-vm", args.vm, "-disk.name", args.name, "-size", args.size);
 			}
-			return { argv };
+			const out = await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+			return { kind: "ok", text: truncateOutput(out.stdout.trim() || `${args.operation} done`, config.maxOutputChars) };
 		},
 		gate(args) {
 			return `${args.operation} disk on VM "${args.vm}"`;
@@ -1094,10 +1129,13 @@ export const TOOLS = [
 				argv.push("snapshot.tree", "-vm", args.vm);
 			} else if (args.operation === "create") {
 				if (!args.name) throw new Error("invalid arguments: name is required for create");
-				argv.push("snapshot.create", "-vm", args.vm, args.name);
+				// Go's flag package stops at the first positional, so every flag
+				// must precede the snapshot NAME (the only positional).
+				argv.push("snapshot.create", "-vm", args.vm);
 				if (args.description !== undefined) argv.push("-d", args.description);
 				if (args.memory === false) argv.push("-m=false");
 				if (args.quiesce) argv.push("-q");
+				argv.push(args.name);
 			} else if (args.operation === "revert") {
 				argv.push("snapshot.revert", "-vm", args.vm);
 				if (args.name !== undefined) argv.push(args.name);

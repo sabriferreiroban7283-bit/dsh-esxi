@@ -39,7 +39,7 @@ case "$1" in
     esac
     ;;
   vm.info)
-    echo '{"VirtualMachines":[{"Name":"VM1","Runtime":{"PowerState":"poweredOn","ConnectionState":"connected","Host":{"Name":"esxi-1"}},"Config":{"Name":"VM1","NumCpu":2,"MemorySizeMB":4096},"Guest":{"IpAddress":"10.0.0.1","HostName":"vm1.example.com","ToolsStatus":"toolsOk"}},{"Name":"VM2","Runtime":{"PowerState":"poweredOff","ConnectionState":"connected"},"Config":{"Name":"VM2","NumCpu":4,"MemorySizeMB":8192},"Guest":{}}]}'
+    echo '{"virtualMachines":[{"name":"VM1","runtime":{"powerState":"poweredOn","connectionState":"connected","host":{"name":"esxi-1"}},"config":{"name":"VM1","numCPU":2,"memorySizeMB":4096,"datastoreUrl":[{"name":"datastore1"}]},"guest":{"ipAddress":"10.0.0.1","hostName":"vm1.example.com","toolsStatus":"toolsOk"}},{"name":"VM2","runtime":{"powerState":"poweredOff","connectionState":"connected"},"config":{"name":"VM2","numCPU":4,"memorySizeMB":8192,"datastoreUrl":[{"name":"datastore1"}]},"guest":{}}]}'
     ;;
   host.info)
     echo '{"HostSystems":[{"Name":"esxi-1","Runtime":{"ConnectionState":"connected","PowerState":"poweredOn","InMaintenanceMode":false},"Summary":{"Config":{"Product":{"Name":"VMware ESXi","Version":"8.0.2","Build":"22380479"}},"Hardware":{"CpuModel":"Intel Xeon Gold 6338","NumCpuCores":32,"MemorySize":257698037760},"QuickStats":{"OverallCpuUsage":7}}}]}'
@@ -94,6 +94,27 @@ case "$1" in
     ;;
   device.serial.connect)
     echo "SERIAL-CONNECT $*"
+    ;;
+  vm.disk.create)
+    echo "DISK-CREATE $*"
+    ;;
+  vm.clone)
+    case "$*" in
+      *licensetest*) echo "fake govc: vm.clone failed: The operation is not supported on the object." >&2; exit 1 ;;
+      *) echo "CLONE $*" ;;
+    esac
+    ;;
+  snapshot.tree)
+    echo "snap1"
+    ;;
+  snapshot.create)
+    echo "SNAP $*"
+    ;;
+  snapshot.revert)
+    echo "REVERT $*"
+    ;;
+  snapshot.remove)
+    echo "SNAPREMOVE $*"
     ;;
   device.boot)
     echo "BOOT $*"
@@ -491,6 +512,15 @@ try {
 	check("esxi_vm_iso add passes the controller", isoAdd.includes("CDROM-ADD device.cdrom.add -vm x -controller ide-200"), isoAdd);
 	const bootOrder = (await exec("esxi_vm_boot", { vm: "x", order: "cdrom,disk", delay: 500, secure: false })).text;
 	check("esxi_vm_boot builds the device.boot argv", bootOrder.includes("BOOT device.boot -vm x -order cdrom,disk -delay 500 -secure=false"), bootOrder);
+
+	// ── field-hardened behaviors (datastore defaulting, flag order, license errors) ──
+	const diskCreate = (await exec("esxi_vm_disk", { vm: "VM1", operation: "create", name: "VM1/disk2", size: "1GB" })).text;
+	check("esxi_vm_disk create defaults the datastore to the VM's own", diskCreate.includes("DISK-CREATE vm.disk.create -vm VM1 -name VM1/disk2 -size 1GB -ds datastore1"), diskCreate);
+	const snapCreate = (await exec("esxi_vm_snapshot", { vm: "x", operation: "create", name: "snap1", description: "baseline", memory: false })).text;
+	check("esxi_vm_snapshot create keeps flags before the positional name", snapCreate.includes("snapshot.create -vm x -d baseline -m=false snap1"), snapCreate);
+	const cloneOk = (await exec("esxi_vm_clone", { vm: "VM1", name: "c1", powerOn: false })).text;
+	check("esxi_vm_clone defaults the datastore to the source VM's", cloneOk.includes("CLONE vm.clone -vm VM1 -on=false -ds datastore1 c1"), cloneOk);
+	await expectThrow("esxi_vm_clone", { vm: "VM1", name: "licensetest" }, /license does not permit CloneVM_Task/, "clone license failure translated");
 
 	// ── esxi_seed_iso (autoinstall seed generation + upload) ───────────────
 	const seedUpload = (await exec("esxi_seed_iso", {

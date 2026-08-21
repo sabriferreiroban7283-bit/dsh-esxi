@@ -201,6 +201,29 @@ reads them through VMware Tools on first boot (no OVF environment file is
 created by `import.ova`, so the guestinfo transport is the one that applies).
 Field notes from real deployments:
 
+**Field-tested scratch-VM recipes (verified on an ESXi 8.0 standalone host):**
+
+```
+# create → add disk → snapshot → serial console → delete
+esxi_vm_create { name: "tst-1", cpu: 1, memory: 1024, disk: "2GB", datastore: "datastore2", guestId: "otherLinux64Guest", network: "VM Network", powerOn: false }
+esxi_vm_disk   { vm: "tst-1", operation: "create", name: "tst-1/disk2", size: "1GB" }   # datastore defaults to the VM's own
+esxi_vm_snapshot { vm: "tst-1", operation: "create", name: "snap1", memory: false }
+esxi_vm_serial { vm: "tst-1", operation: "add" }
+esxi_vm_serial { vm: "tst-1", operation: "connect", uri: "-" }                            # boot log to <vm>/serialport-9000.log
+esxi_vm_power  { vm: "tst-1", operation: "on" }
+esxi_vm_delete { vm: "tst-1" }
+```
+
+Hardened behaviors (so these recipes do not need the trial-and-error they
+originally took): `esxi_vm_disk create` and `esxi_vm_clone` default the
+datastore to the VM's own (govc's default-datastore resolution is ambiguous
+on multi-datastore hosts); `esxi_vm_snapshot create` emits flags before the
+positional snapshot name (Go's flag parser stops at the first positional);
+`esxi_vm_clone` translates the host's license error
+("not supported on the object" → CloneVM_Task not licensed) into guidance
+(use export/import on standalone hosts without the clone right); a missing
+govc binary is re-installed automatically on the first ENOENT.
+
 - **Set the NIC MAC explicitly.** `import.ova` can leave the MAC empty, and
   DHCP silently fails on an empty-MAC NIC:
   `esxi_vm_network { vm: "…", operation: "change", device: "ethernet-0", network: "VM Network", mac: "-" }`
