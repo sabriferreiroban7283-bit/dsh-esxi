@@ -13,6 +13,45 @@ import { createWriteStream } from "node:fs";import { pipeline } from "node:strea
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Authentication failure latch: one rejected login per target URL halts
+// further login attempts for 15 minutes (the typical ESXi account-lockout
+// window). Retrying a stale stored password is what locks accounts — five
+// failures do it on most hosts — so the runner fails fast with guidance
+// instead of hammering the host.
+// ─────────────────────────────────────────────────────────────────────────────
+const authFailures = new Map();
+const AUTH_LATCH_MS = 15 * 60 * 1000;
+const AUTH_ERROR_MARKERS = [
+	"incorrect user name or password",
+	"cannot complete login",
+	"cannot log in",
+	"account.*locked",
+	"login failed"
+];
+const AUTH_FAILURE_HINT = "esxi: the stored password was rejected by the host. STOP retrying — repeated attempts lock the ESXi account (usually 5 failures). Update the profile with the correct password via esxi_connect, then wait ~15 minutes for any lockout to clear before retrying.";
+
+/** True when the target URL is inside the auth-failure latch window. */
+export function isAuthLatched(url) {
+	const stamped = authFailures.get(String(url ?? ""));
+	if (stamped === undefined) return false;
+	if (Date.now() - stamped > AUTH_LATCH_MS) {
+		authFailures.delete(String(url ?? ""));
+		return false;
+	}
+	return true;
+}
+
+/** Record a rejected login for the target URL (env URL), starting the latch. */
+export function latchAuthFailure(env) {
+	authFailures.set(String(env?.GOVC_URL ?? ""), Date.now());
+}
+
+/** Clear the latch for a URL — e.g. after esxi_connect stores a new password. */
+export function clearAuthLatch(url) {
+	authFailures.delete(String(url ?? ""));
+}
+
 const execFileP = promisify(execFile);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,6 +312,9 @@ export class EsxiCommandError extends Error {
 export async function runGovc(govcPath, argv, { env, timeoutMs = 120000, maxBufferBytes = 64 * 1024 * 1024 } = {}) {
 	let stdout = "";
 	let stderr = "";
+	// Fail fast while a previous login was rejected for this target: retrying a
+	// stale stored password is what locks ESXi accounts (5 failures, typically).
+	if (isAuthLatched(env?.GOVC_URL)) throw new Error(AUTH_FAILURE_HINT);
 	try {
 		const result = await execFileP(govcPath, argv, {
 			env,
@@ -283,12 +325,24 @@ export async function runGovc(govcPath, argv, { env, timeoutMs = 120000, maxBuff
 		stdout = result.stdout ?? "";
 		stderr = result.stderr ?? "";
 	} catch (error) {
+		// A rejected login latches the target so later calls stop trying it
+		// (see the latch above); the error surfaces the guidance too.
+		const authDetail = ((error.stderr ?? "") + " " + (error.stdout ?? "")).trim();
+		if (AUTH_ERROR_MARKERS.some((marker) => new RegExp(marker, "i").test(authDetail))) {
+			latchAuthFailure(env);
+			throw new Error(`${AUTH_FAILURE_HINT} (${authDetail.slice(0, 200)})`);
+		}
 		// The harness host occasionally loses the installed govc binary; recover
 		// transparently by re-installing it once and retrying the same command.
 		if (error.code === "ENOENT") {
 			try {
-				await installGovc(dirname(govcPath));
-				const result = await execFileP(govcPath, argv, {
+				// Prefer a stable install dir over the caller's (possibly bare)
+				// govcPath dir, and RETRY WITH THE INSTALLED BINARY — a bare
+				// "govc" path stays unresolvable even after installation.
+				const installDir = dirname(govcPath) === "." ? join(dshHomePath(), "esxi", "bin") : dirname(govcPath);
+				const installed = await installGovc(installDir);
+				const retryPath = installed?.binary ?? govcPath;
+				const result = await execFileP(retryPath, argv, {
 					env,
 					timeout: timeoutMs,
 					maxBuffer: maxBufferBytes,

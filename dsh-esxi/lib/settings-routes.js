@@ -89,12 +89,21 @@ export async function applySettingsOps(settings, ns, ops, expectedRevision) {
 }
 
 /** Read the card-facing descriptor for the namespace (redacted, writable). */
+function redactDescriptorLayer(layer) {
+	if (layer === undefined || layer === null || typeof layer !== "object") return layer;
+	const copy = JSON.parse(JSON.stringify(layer));
+	for (const profile of Array.isArray(copy?.profiles) ? copy.profiles : []) {
+		if (profile && typeof profile === "object" && "password" in profile) profile.password = "••••••••";
+	}
+	return copy;
+}
+
 function descriptorOf(settings) {
 	const found = (settings.describe({ redactSecrets: true }) ?? []).find((candidate) => candidate.ns === NAMESPACE);
 	if (found === undefined) return undefined;
 	return {
-		value: found.value,
-		user: found.user ?? {},
+		value: redactDescriptorLayer(found.value),
+		user: redactDescriptorLayer(found.user ?? {}),
 		revision: found.revision,
 		writable: true
 	};

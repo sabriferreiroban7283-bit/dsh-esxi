@@ -33,6 +33,7 @@ case "$1" in
       h) echo '["/DC1/host/esxi-1"]' ;;
       m) echo '["/DC1/vm/VM1","/DC1/vm/VM2"]' ;;
       s) echo '["/DC1/datastore/datastore1"]' ;;
+      n) echo '["/DC1/network/VM Network"]' ;;
       n,g) echo '["/DC1/network/VM Network","/DC1/network/DVS/portgroup1"]' ;;
       p) echo '["/DC1/host/Cluster1/Resources"]' ;;
       *) echo '[]' ;;
@@ -539,14 +540,16 @@ try {
 	await expectThrow("esxi_vm_clone", { vm: "VM1", name: "licensetest" }, /license does not permit CloneVM_Task/, "clone license failure translated");
 
 	// ── esxi_vm_quick (one-call recipe: create + ISO + serial + power) ──────
-	const quickOut = (await exec("esxi_vm_quick", { name: "q1", cpu: 2, memory: 2048, disk: "10GB", datastore: "datastore1", iso: "iso/x.iso", serial: true, powerOn: true })).text;
-	check("esxi_vm_quick creates the VM", quickOut.includes('created VM "q1" (2 vCPU / 2048MB / disk 10GB on datastore1)'), quickOut);
+	const quickOut = (await exec("esxi_vm_quick", { name: "q1", cpu: 2, memory: 2048, disk: "10GB", datastore: "datastore1", network: "VM Network", iso: "iso/x.iso", serial: true, powerOn: true })).text;
+	check("esxi_vm_quick creates the VM", quickOut.includes('created VM "q1" (2 vCPU / 2048MB / disk 10GB on datastore1, network "VM Network")'), quickOut);
 	check("esxi_vm_quick attaches and connects the ISO", quickOut.includes("attached ISO iso/x.iso on cdrom-3000 (connected, cdrom-first boot)"), quickOut);
 	check("esxi_vm_quick wires the serial console", quickOut.includes("serial console serialport-9001 → [datastore1] q1/serialport-9001.log"), quickOut);
 	check("esxi_vm_quick powers on", quickOut.includes("powered on"), quickOut);
 	const quickCi = (await exec("esxi_vm_quick", { name: "q2", cpu: 1, memory: 512, disk: "10GB", datastore: "datastore1", cloudinit: "#cloud-config\nhostname: q2\n", powerOn: true })).text;
 	check("esxi_vm_quick injects the cloud-init seed", quickCi.includes("cloud-init seed injected via guestinfo"), quickCi);
 	check("esxi_vm_quick skips ISO/serial when not requested", !quickCi.includes("attached ISO") && !quickCi.includes("serial console"), quickCi);
+	const quickAutoNet = (await exec("esxi_vm_quick", { name: "q3", cpu: 1, memory: 512, disk: "10GB", datastore: "datastore1" })).text;
+	check("esxi_vm_quick auto-resolves the single network", quickAutoNet.includes('network "VM Network"'), quickAutoNet);
 	await expectThrow("esxi_vm_quick", { name: "q2", datastore: "d" }, /missing required parameter "disk"/, "quick create without disk rejected");
 
 	// ── round 4: role positional order + tags vCenter-only translation ──────
@@ -586,12 +589,13 @@ try {
 		});
 		const degradedExec = async (name, args) => degraded.registered.get(name).execute(args, {});
 
-		const doctorMissing = (await degradedExec("esxi_doctor", {})).text;
-		check("esxi_doctor guides when govc missing", doctorMissing.includes("govc is required"), doctorMissing);
-
+		// The auto-install path downloads the real govc on ENOENT, so stub the
+		// network BEFORE exercising the missing-binary guidance.
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = async () => ({ ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) });
 		try {
+			const doctorMissing = (await degradedExec("esxi_doctor", {})).text;
+			check("esxi_doctor guides when govc missing", doctorMissing.includes("govc is required"), doctorMissing);
 			const doctorInstall = (await degradedExec("esxi_doctor", { install: true })).text;
 			check("esxi_doctor reports install failure as text", doctorInstall.includes("govc installation failed"), doctorInstall);
 		} finally {

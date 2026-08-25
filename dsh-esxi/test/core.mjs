@@ -6,7 +6,7 @@
 // dsh-esxi 核心单元测试：纯工具函数与进程封装——splitArgs、normalizeUrl、
 // passwordRefFor、格式化、profile 存储持久化规则、runLocal 失败整形，以及以
 // 桩 fetch 提供伪造 gzip 二进制的 installGovc。无网络、无 harness。
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -287,6 +287,35 @@ check("autoinstall user-data includes packages", userData.includes("- open-vm-to
 	check("vmdk second allocated grain preserved", raw.subarray(256 * sector).every((b) => b === 0xcd), String(raw[256 * sector]));
 	const desc = flatDescriptor({ fileName: "x-flat.vmdk", capacitySectors });
 	check("vmdk descriptor names the flat and uses valid geometry", desc.includes('createType="monolithicFlat"') && desc.includes('RW ' + capacitySectors + ' FLAT "x-flat.vmdk" 0') && /cylinders = "[1-9][0-9]*"/.test(desc) && !desc.includes('cylinders = "0"'), desc);
+}
+
+// ── auth-failure latch: one rejected login stops further spawns ─────────────
+{
+	const { runGovc, isAuthLatched, clearAuthLatch } = await import("../lib/core.js");
+	const script = await mkdtemp(join(tmpdir(), "dsh-esxi-latch-"));
+	const fake = join(script, "govc");
+	await writeFile(fake, `#!/bin/sh\nn=$(cat "${join(script, "count")}" 2>/dev/null || echo 0)\necho $((n+1)) > "${join(script, "count")}"\necho "ServerFaultCode: Cannot complete login due to an incorrect user name or password." >&2\nexit 1\n`);
+	await chmod(fake, 0o755);
+	const env = { GOVC_URL: "https://latched.example/sdk", GOVC_USERNAME: "root", GOVC_PASSWORD: "bad" };
+	let firstError = "";
+	try {
+		await runGovc(fake, ["about"], { env, timeoutMs: 5000 });
+	} catch (error) {
+		firstError = error.message;
+	}
+	check("auth rejection latches with guidance", firstError.includes("lock the ESXi account") && firstError.includes("incorrect user name or password"), firstError.slice(0, 120));
+	check("auth latch is active for the URL", isAuthLatched(env.GOVC_URL) === true, String(isAuthLatched(env.GOVC_URL)));
+	const before = await readFile(join(script, "count"), "utf8");
+	let secondError = "";
+	try {
+		await runGovc(fake, ["about"], { env, timeoutMs: 5000 });
+	} catch (error) {
+		secondError = error.message;
+	}
+	const after = await readFile(join(script, "count"), "utf8");
+	check("latched call fails fast without spawning", secondError.includes("STOP retrying") && before === after, `spawns ${before}->${after}, msg: ${secondError.slice(0, 80)}`);
+	clearAuthLatch(env.GOVC_URL);
+	check("latch clears explicitly", isAuthLatched(env.GOVC_URL) === false, String(isAuthLatched(env.GOVC_URL)));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

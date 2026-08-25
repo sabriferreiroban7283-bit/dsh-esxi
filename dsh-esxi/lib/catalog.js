@@ -9,6 +9,7 @@
 // 执行器。本文件不导入任何 harness 模块；由 index.js 完成注册。
 import {
 	buildEnv,
+	clearAuthLatch,
 	dshHomePath,
 	formatDatastoreInfoJson,
 	formatHostInfoJson,
@@ -66,6 +67,19 @@ async function vmDatastore(config, env, vm) {
 	if (urls.length === 0) throw new Error(`could not determine the datastore of VM "${vm}"; pass datastore explicitly`);
 	if (urls.length > 1) throw new Error(`VM "${vm}" spans multiple datastores (${urls.map((u) => u.name).join(", ")}); pass datastore explicitly`);
 	return urls[0].name;
+}
+
+/**
+* Resolve the single network of the inventory for tools that default to it.
+* govc's own default-network resolution fails with 'default network resolves
+* to multiple instances' on multi-network hosts, so resolve explicitly.
+*/
+async function resolveDefaultNetwork(config, env) {
+	const result = await runGovc(config.govcPath, ["find", "-type", "n", "-json"], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+	const paths = JSON.parse(result.stdout);
+	if (!Array.isArray(paths) || paths.length === 0) return undefined;
+	if (paths.length > 1) throw new Error(`multiple networks exist (${paths.map((p) => p.split("/").pop()).join(", ")}) — pass network explicitly`);
+	return String(paths[0]).split("/").pop();
 }
 
 /**
@@ -173,6 +187,7 @@ export const TOOLS = [
 			store.upsert(args.profile, record);
 			if (args.setDefault === true || store.defaultName() === undefined) store.setDefault(args.profile);
 			await store.save();
+			clearAuthLatch(url); // a fresh password resets the fail-fast latch
 			const lines = [
 				`Connected profile "${args.profile}":`,
 				`  url: ${url}`,
@@ -638,14 +653,16 @@ export const TOOLS = [
 			const password = await resolvePassword(ctx, resolved.profile);
 			const env = buildEnv(resolved.profile, { password });
 			const steps = [];
+			let network = args.network;
+			if (network === undefined) network = await resolveDefaultNetwork(config, env);
 			const argv = ["vm.create", "-c", String(args.cpu ?? 1), "-m", String(args.memory ?? 1024), "-disk", args.disk, "-on=false"];
 			argv.push("-ds", args.datastore);
 			if (args.guestId !== undefined) argv.push("-g", args.guestId);
-			if (args.network !== undefined) argv.push("-net", args.network);
+			if (network !== undefined) argv.push("-net", network);
 			if (args.adapter !== undefined) argv.push("-net.adapter", args.adapter);
 			argv.push(args.name);
 			await runGovc(config.govcPath, argv, { env, timeoutMs: 300000, maxBufferBytes: config.maxOutputBytes });
-			steps.push(`created VM "${args.name}" (${args.cpu ?? 1} vCPU / ${args.memory ?? 1024}MB / disk ${args.disk} on ${args.datastore})`);
+			steps.push(`created VM "${args.name}" (${args.cpu ?? 1} vCPU / ${args.memory ?? 1024}MB / disk ${args.disk} on ${args.datastore}${network ? `, network "${network}"` : ", no NIC"})`);
 			if (args.iso !== undefined) {
 				const addOut = await runGovc(config.govcPath, ["device.cdrom.add", "-vm", args.name], { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
 				const device = (addOut.stdout || "").trim() || "cdrom-3000";
@@ -1145,8 +1162,15 @@ export const TOOLS = [
 				if (!args.size) throw new Error("invalid arguments: size is required for resize (grow only, e.g. '200GB')");
 				argv.push("vm.disk.change", "-vm", args.vm, "-disk.name", args.name, "-size", args.size);
 			}
-			const out = await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
-			return { kind: "ok", text: truncateOutput(out.stdout.trim() || `${args.operation} done`, config.maxOutputChars) };
+			try {
+				const out = await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				return { kind: "ok", text: truncateOutput(out.stdout.trim() || `${args.operation} done`, config.maxOutputChars) };
+			} catch (error) {
+				if (args.operation === "resize" && /error resizing main disk|Invalid operation for device/i.test(error.message ?? "")) {
+					throw new Error(`the host cannot grow this disk in place (typically a stream-optimized disk imported from an OVA). Options: attach a new larger disk instead, or re-import the OVA with a disk-provisioning spec. (${error.message})`);
+				}
+				throw error;
+			}
 		},
 		gate(args) {
 			return `${args.operation} disk on VM "${args.vm}"`;
@@ -2324,17 +2348,29 @@ export const TOOLS = [
 	},
 	{
 		name: "esxi_task_list",
-		description: "List recent vCenter tasks (govc tasks): entity, operation, state, result, times.",
+		description: "List recent vCenter tasks (govc tasks): entity, operation, state, result, times. Field note: recent-task history is NOT exposed on standalone ESXi hosts (the call fails with 'not supported on the object') — use esxi_event_list there instead, which covers the same lifecycle events.",
 		params: {
 			profile: PROFILE_PARAM,
 			limit: S("integer", "Last N tasks (default 25).", { min: 1 }),
 			hours: S("integer", "Look back window in hours (default 24).", { min: 1 }),
 			path: S("string", "Restrict to tasks on one inventory object.")
 		},
-		build(args) {
+		custom: async function esxiTaskList(ctx, config, store, args) {
+			validateArgs(this.params, args);
+			const resolved = resolveProfileForCall(store, args);
+			const password = await resolvePassword(ctx, resolved.profile);
+			const env = buildEnv(resolved.profile, { password });
 			const argv = ["tasks", "-b", `${args.hours ?? 24}h`, "-n", String(args.limit ?? 25)];
 			if (args.path !== undefined) argv.push(args.path);
-			return { argv };
+			try {
+				const out = await runGovc(config.govcPath, argv, { env, timeoutMs: config.defaultTimeoutMs, maxBufferBytes: config.maxOutputBytes });
+				return { kind: "ok", text: truncateOutput(out.stdout.trim() || "(no tasks)", config.maxOutputChars) };
+			} catch (error) {
+				if (/not supported on the object/i.test(error.message ?? "")) {
+					throw new Error(`recent-task history is a vCenter feature — this standalone ESXi host does not expose it. Use esxi_event_list for the same lifecycle events instead. (${error.message})`);
+				}
+				throw error;
+			}
 		}
 	},
 	{
